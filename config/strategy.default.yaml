@@ -1,0 +1,315 @@
+# ============================================================
+# KHAOS 策略主配置文件（全球顶级量化基金生产环境）
+# ============================================================
+# 版本: 2.1.0
+# 兼容引擎版本: >=2.1.0, <3.0.0
+#
+# 启动前必要条件检查（CI/CD 自动验证）:
+#   1. 环境变量 KHAOS_MODE 已设置且为 paper/live/hybrid
+#   2. 所有 ${...} 占位符均已通过外部 Secret Manager 注入
+#   3. 本文件通过 _integrity.hash 校验
+#   4. NTP 时间同步已完成，偏差 < 1ms
+#
+# 安全警告: 本文件禁止包含任何密钥、口令或机密信息。
+#           修改敏感参数须走审批流程，详见 config_metadata 段。
+# ============================================================
+
+strategy:
+  name: "KHAOS"
+
+  # 运行模式：必须由环境变量 KHAOS_MODE 显式设定，不接受默认值
+  # 允许值: paper, live, hybrid
+  mode: "${KHAOS_MODE}"
+
+  # ---- 配置元数据（不可被运行时直接修改的声明） ----
+  config_metadata:
+    # 标记哪些顶级字段允许运行时动态修改 (mutable: true/false)
+    mutable_fields:
+      mode: false                     # 模式修改需要重启
+      universe: false
+      modules: true                   # 策略模块参数可在前端调整
+      risk_limits: false              # 风控硬约束只能通过审批修改
+      execution: true
+      cost_model: true
+      circuit_breaker: false
+      data_integrity: false
+      monitoring: true
+      compliance: false
+      stress_testing: true
+      rollback: false
+      capital_allocation: false
+      broker: false
+    audit_required_for: ["risk_limits", "circuit_breaker", "compliance"]
+
+  # ---- 交易标的与周期 ----
+  universe:
+    symbols:
+      - symbol: "BTCUSDT"
+        # 可为每个交易对覆盖全局风险限制
+        risk_overrides:
+          position_concentration_max: 0.30   # BTC可稍高
+          max_leverage: 2.0
+      # - symbol: "ETHUSDT"
+      #   risk_overrides:
+      #     position_concentration_max: 0.20
+    timeframe: "3m"
+    quote_asset: "USDT"
+    min_notional: 10.0
+
+  # ---- 模块配置 ----
+  modules:
+    # -------------------- 趋势线 --------------------
+    trendline:
+      type: "kalman"
+      params:
+        q_ratio: 0.01
+
+    # -------------------- 市场状态推断 --------------------
+    regime:
+      type: "hmm"
+      params:
+        states: 3
+        retrain_policy:
+          trigger: "time_or_samples"
+          interval_minutes: 1440
+          kline_count: 500
+          min_samples_after_retrain: 200
+          # 训练集截止：当前K线之前的N根，防止数据泄露
+          train_test_split:
+            train_window: 400            # 训练集最多使用最近400根
+            gap: 1                       # 预测开始与训练结束之间间隔1根K线
+
+    # -------------------- 微观结构加速器 --------------------
+    micro_accel:
+      type: "orderflow"
+      params:
+        bpi_thresh: 0.25
+        taker_thresh: 0.3
+        depth_levels: 10
+        aggregation: "volume_weighted"
+        window_ticks: 20
+
+    # -------------------- 资金与仓位管理 --------------------
+    sizer:
+      type: "vol_target"
+      params:
+        risk_per_trade: 0.01
+        vol_target_annual: 0.20
+        max_leverage: 3.0
+        vol_adj_factor: 0.5
+        max_position_pct: 0.15
+
+    # -------------------- 动态止损 --------------------
+    stops:
+      type: "dynamic_kma"
+      params:
+        alpha_base: 2.5
+        alpha_volatility_scale: 1.2
+        alpha_floor: 0.5
+
+    # -------------------- 加仓规则 --------------------
+    add_rules:
+      type: "atr_scale"
+      params:
+        step_atr: 0.5
+        max_additions: 5
+        size_sequence: "vol_target"
+
+  # ---- 风险限制（硬约束） ----
+  risk_limits:
+    max_daily_loss_pct: 0.05
+    max_consecutive_losses: 5
+    max_drawdown_from_peak_pct: 0.15
+    position_concentration_max: 0.25
+    net_exposure_max_pct: 3.0
+    volatility_breaker:
+      enabled: true
+      # 使用历史分位数替代固定倍数
+      volatility_percentile_threshold: 0.99   # 波动率超过历史99%分位时触发
+      lookback_window_days: 30                # 计算历史分位数的窗口
+    # 触发后的恢复策略
+    recovery:
+      daily_loss:
+        action: "lock_until_next_day_utc"     # UTC 0点解锁
+        resume_ramp: "linear"                # 线性恢复仓位 (full / linear)
+        ramp_duration_minutes: 60
+      max_drawdown:
+        action: "reduce_to_50pct"
+        resume_ramp: "manual"                # 需要人工确认恢复
+
+  # ---- 订单执行配置 ----
+  execution:
+    # 默认使用限价单，市价单需要显式开启并经过二次确认
+    order_type: "limit"
+    allow_market_orders: false              # 若需启用，必须通过风控审批
+    limit_offset_bps: 2.0                   # 限价单相对于对手价的偏移（bps）
+    max_order_value: 1000000.0
+    time_in_force: "GTC"
+    retry_attempts: 2
+    retry_delay_ms: 200
+    retry_backoff: "exponential"            # 重试退避策略: fixed, exponential
+    cancel_timeout_sec: 5.0
+    unfilled_action: "cancel"               # 限价单未成交后的行为: cancel, switch_to_market (需allow_market_orders), reprice_limit
+    twap:
+      enabled: false
+      slice_duration_sec: 60
+      total_duration_sec: 600
+      max_participation_rate: 0.05          # 每切片成交量不超过市场成交量的5%
+      insufficient_liquidity_action: "extend" # 流动性不足时: extend (延长时间), reduce_size, cancel
+
+  # ---- 市场冲击模型 ----
+  market_impact:
+    enabled: true
+    linear_coefficient: 0.1                # 每成交市占率1%带来的价格冲击（bps）
+    max_participation_rate_global: 0.05    # 全局最大参与率
+    impact_estimate: "pre_trade"           # 在下单前估算冲击成本，超限则调整订单量
+
+  # ---- 流动性最低要求 ----
+  liquidity_requirements:
+    min_daily_volume_usdt: 50000000        # 标的24小时成交量需大于此值
+    min_orderbook_depth_bps: 50            # 订单簿前10档深度至少能容纳名义价值的50bps冲击
+    check_on_order: true                   # 每次下单前实时检查
+
+  # ---- 交易成本模型 ----
+  cost_model:
+    maker_fee: 0.0002
+    taker_fee: 0.0004
+    # 滑点估算
+    base_slippage_pct: 0.0005              # 普通市场下的保守估算
+    twap_slippage_pct: 0.0003              # TWAP 执行时的预计滑点
+    stress_slippage_pct: 0.005             # 压力市场下额外增加的滑点
+    funding_rate:
+      enabled: true                        # 是否考虑永续合约资金费率
+      use_real_time: true                  # 使用实时费率还是保守固定值
+      conservative_rate_8h: 0.001          # 若保守固定值，每8小时费率
+
+  # ---- 模拟交易(虚拟券商)配置 ----
+  paper_trading:
+    enabled: true
+    # 资金规模可映射真实资金比例，以反映真实流动性
+    balance_scale_mode: "proportional"     # proportional (按比例) / fixed
+    capital_reference_pct: 1.0            # 若proportional，使用真实总资金的1%作为模拟本金
+    initial_balance: 1000000.0            # 当scale_mode=fixed时生效
+    latency_model:
+      type: "normal"
+      params:
+        mean_ms: 200
+        std_ms: 50
+    slippage_model:
+      type: "orderbook"
+      params:
+        fixed_pct: 0.0005
+        orderbook_depth_levels: 10
+        statistical_sample_size: 1000
+    order_validation:
+      max_leverage: 3.0
+      max_price_deviation_pct: 5.0
+      min_order_value: 10.0
+
+  # ---- 系统熔断与降级 ----
+  circuit_breaker:
+    enabled: true
+    max_consecutive_system_errors: 3
+    error_window_sec: 60
+    pnl_trigger: -0.10
+    resource_limits:
+      cpu_percent: 90
+      memory_percent: 85
+      # 磁盘I/O等待时间阈值 (ms)
+      disk_io_wait_ms: 50
+      # GC 暂停时间阈值 (ms)
+      gc_pause_ms: 100
+
+  # ---- 数据完整性 ----
+  data_integrity:
+    max_data_age_ms: 2000
+    stale_action: "skip"
+    outlier_detection:
+      enabled: true
+      price_std_multiplier: 10.0
+    backfill_window: 1000
+
+  # ---- 系统时钟同步 ----
+  time_sync:
+    ntp_servers: ["pool.ntp.org", "time.google.com"]
+    max_offset_ms: 5.0                    # 与 NTP 服务器最大允许偏差
+    offset_exceeded_action: "warn_and_stop" # warn_only, warn_and_stop
+
+  # ---- 状态持久化与恢复 ----
+  state_persistence:
+    enabled: true
+    snapshot_interval_sec: 60             # 状态快照间隔
+    restore_on_startup: true              # 启动时是否恢复最新状态
+    max_restore_age_sec: 300              # 若快照超过此时间，视为过期，使用交易所数据重建
+    conflict_resolution: "exchange_wins"  # 状态冲突时以交易所数据为准
+
+  # ---- 监控与报警 ----
+  monitoring:
+    heartbeat_interval_sec: 30
+    alert_channels:
+      - type: "pagerduty"                 # 增加高优先级通道
+        priority: 1
+        api_key: "${PAGERDUTY_API_KEY}"
+        fallback: "webhook"
+      - type: "webhook"
+        priority: 2
+        url: "${ALERT_WEBHOOK_URL}"
+        fallback: "email"
+      - type: "email"
+        priority: 3
+        recipients: ["ops@khaosfund.com"]
+    metrics_export:
+      prometheus: true
+      prometheus_port: 9090
+
+  # ---- 合规与审计 ----
+  compliance:
+    audit_log_enabled: true
+    order_retention_days: 2555
+    report_generation: "daily"
+    # 交易时段控制（加密市场可忽略，为传统市场预留接口）
+    trading_schedule:
+      enabled: false                      # 若启用，将限制开仓和平仓时间
+      timezone: "America/New_York"
+      sessions:
+        - start: "09:30"
+          end: "16:00"
+
+  # ---- 压力测试参数 ----
+  stress_testing:
+    enabled: true
+    schedule: "monthly"
+    scenarios_count: 5000
+    extreme_vol_multiplier: 5.0
+    base_metric: "daily_volatility"       # 明确基准指标
+    base_lookback_days: 90
+
+  # ---- 配置回滚 ----
+  rollback:
+    enabled: true
+    snapshot_storage: "s3://khaos-config-snapshots/"
+    auto_trigger_conditions:
+      - max_drawdown_exceeded: 0.15
+      - rolling_sharpe_30d_below: 0.5     # 明确滚动窗口
+      - error_rate_above: 0.05
+    require_manual_approval: true         # 自动回滚前是否需要人工确认
+
+  # ---- 资金分配 ----
+  capital_allocation:
+    strategy_limit_pct: 0.20
+
+  # ---- Broker 配置 ----
+  broker:
+    type: "binance"
+    params:
+      api_key: "${BINANCE_API_KEY}"
+      secret: "${BINANCE_SECRET}"
+      testnet: false
+      default_leverage: 1.0
+      margin_type: "ISOLATED"
+      position_mode: "Hedge"
+
+# ---- 完整性校验 ----
+_integrity:
+  hash: ""
+  algorithm: "sha256"
