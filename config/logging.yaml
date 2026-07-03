@@ -1,0 +1,211 @@
+# ============================================================
+# KHAOS 日志配置文件（全球顶级对冲基金生产级）
+# ============================================================
+# 版本: 2.5.0
+# 兼容引擎版本: >=2.5.0, <3.0.0
+#
+# 说明:
+# 1. 日志路径、级别等可通过环境变量覆盖，支持容器化部署。
+# 2. 审计日志必须启用 JSON 格式并发送至不可变存储（如 Kafka WORM 主题）。
+# 3. 所有文件 handler 均配置大小限制，防止磁盘耗尽。
+# 4. 集成异步队列处理器，避免 I/O 阻塞主线程。
+# 5. 敏感信息通过全局过滤器自动脱敏，确保 API 密钥等不落地。
+# 6. 推荐配合 Sentry 进行错误聚合，配置示例见文件尾注释。
+#
+# 依赖:
+#   - python-json-logger (用于 JSON 格式化)
+#   - sentry-sdk (可选，用于错误追踪)
+# ============================================================
+
+version: 1
+disable_existing_loggers: false
+
+# 全局常量（通过环境变量注入）
+env:
+  LOG_DIR: "${LOG_DIR:-/var/log/khaos}"
+  ENV: "${ENV:-production}"
+  KHAOS_INSTANCE_ID: "${KHAOS_INSTANCE_ID:-unknown}"
+  ROOT_LOG_LEVEL: "${ROOT_LOG_LEVEL:-INFO}"
+  SENTRY_DSN: "${SENTRY_DSN:-}"
+
+# 格式定义
+formatters:
+  brief:
+    format: "%(asctime)s.%(msecs)03d UTC [%(levelname)-8s] %(name)s: %(message)s"
+    datefmt: "%Y-%m-%dT%H:%M:%S"
+
+  detailed:
+    format: "%(asctime)s.%(msecs)03d UTC [%(levelname)-8s] %(name)s (%(threadName)s) %(module)s:%(lineno)d: %(message)s"
+    datefmt: "%Y-%m-%dT%H:%M:%S"
+
+  json:
+    # 使用 python-json-logger 库，自动序列化日志记录为 JSON
+    class: pythonjsonlogger.jsonlogger.JsonFormatter
+    format: "%(asctime)s %(levelname)s %(name)s %(threadName)s %(module)s %(lineno)d %(message)s"
+    # 注入默认字段，便于日志聚合查询
+    defaults:
+      service: "khaos"
+      environment: "${ENV}"
+      instance_id: "${KHAOS_INSTANCE_ID}"
+
+  audit_json:
+    class: pythonjsonlogger.jsonlogger.JsonFormatter
+    format: "%(asctime)s %(message)s"
+    defaults:
+      log_type: "audit"
+      service: "khaos"
+      environment: "${ENV}"
+      instance_id: "${KHAOS_INSTANCE_ID}"
+
+# 过滤器
+filters:
+  sensitive_data:
+    # 自定义过滤器类，实现 API key, secret 等自动脱敏
+    # 类路径需在代码中注册: khaos.utils.logging.SensitiveDataFilter
+    class: khaos.utils.logging.SensitiveDataFilter
+    # 示例替换规则: re.sub(r'(api_key|secret)=[^\s]+', r'\1=***', msg)
+
+  health_check_filter:
+    # 抑制 /health 端点的访问日志
+    class: khaos.utils.logging.HealthCheckFilter
+
+# 处理器
+handlers:
+  # 控制台输出（人类可读）
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: brief
+    stream: ext://sys.stdout
+    filters: [sensitive_data]
+
+  # 异步队列包装器，避免磁盘 I/O 阻塞
+  queue:
+    class: logging.handlers.QueueHandler
+    # 队列监听器将在代码中启动，绑定到下面的文件 handler
+    # 此处占位，实际使用时将 file_info, file_error 等设置为 QueueListener 的目标
+    # 为保持配置简洁，我们直接在代码中构建 QueueListener，此处定义基础 handler
+    # 用户可在代码中通过 handlers 创建 QueueHandler 和 QueueListener
+
+  # 常规信息日志文件（带轮转和大小限制）
+  file_info:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: detailed
+    filename: "${LOG_DIR}/khaos.log"
+    maxBytes: 104857600           # 100 MB
+    backupCount: 30
+    encoding: "utf-8"
+    filters: [sensitive_data]
+
+  # 错误日志文件（单独存储，保留更久）
+  file_error:
+    class: logging.handlers.RotatingFileHandler
+    level: WARNING
+    formatter: detailed
+    filename: "${LOG_DIR}/khaos_error.log"
+    maxBytes: 104857600
+    backupCount: 90
+    encoding: "utf-8"
+    filters: [sensitive_data]
+
+  # 结构化 JSON 日志文件（供集中日志系统采集）
+  file_json:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: json
+    filename: "${LOG_DIR}/khaos_structured.log"
+    maxBytes: 104857600
+    backupCount: 30
+    encoding: "utf-8"
+    filters: [sensitive_data]
+
+  # 审计日志（JSON格式，建议同时写入不可变远端）
+  audit_file:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: audit_json
+    filename: "${LOG_DIR}/audit.log"
+    maxBytes: 104857600
+    backupCount: 2555           # 约7年
+    encoding: "utf-8"
+    filters: [sensitive_data]
+
+  # 错误追踪（如果配置了 SENTRY_DSN 则启用）
+  sentry:
+    class: sentry_sdk.integrations.logging.EventHandler
+    level: ERROR
+    # 条件启用：若未设置 DSN，则该 handler 不生效（需代码判断）
+
+  null:
+    class: logging.NullHandler
+
+# 根日志器
+root:
+  level: "${ROOT_LOG_LEVEL}"   # 支持动态调整
+  handlers: [console, file_info, file_error, file_json]
+  # 注意：实际部署时，可能将 file_xxx 封装在 QueueListener 中，确保非阻塞
+
+# 特定模块日志级别
+loggers:
+  # 抑制第三方库噪声
+  urllib3:
+    level: WARNING
+  matplotlib:
+    level: WARNING
+  ccxt:
+    level: WARNING
+  asyncio:
+    level: WARNING
+  uvicorn.access:
+    level: WARNING
+    filters: [health_check_filter]
+
+  # KHAOS 核心模块
+  khaos.strategy:
+    level: DEBUG
+    propagate: true            # 传播至 root，由其统一处理
+  khaos.engine:
+    level: INFO
+    propagate: true
+  khaos.evolution:
+    level: INFO
+    propagate: true
+  khaos.adapters:
+    level: INFO
+    propagate: true
+  khaos.api:
+    level: INFO
+    propagate: true
+
+  # 审计日志独立处理器，不传播到 root
+  khaos.audit:
+    level: INFO
+    propagate: false
+    handlers: [audit_file]
+
+  # 安全日志（可单独配置）
+  khaos.security:
+    level: INFO
+    propagate: false
+    handlers: [file_info, file_error]
+
+# 注意：
+# 1. 所有文件日志路径由环境变量 LOG_DIR 控制，部署时确保该目录存在且仅可被应用用户写入（权限 0700）。
+# 2. 推荐使用 logrotate 对旧日志进行压缩，配置示例：
+#    /var/log/khaos/*.log {
+#        daily
+#        rotate 30
+#        compress
+#        delaycompress
+#        missingok
+#        notifempty
+#        create 0600 khaos khaos
+#    }
+# 3. 若要启用异步日志，在代码中创建 QueueHandler 和 QueueListener，将 file handler 作为目标。
+# 4. Sentry 集成需安装 sentry-sdk，并在代码中调用 sentry_sdk.init() 初始化。
+
+# ---- 完整性校验 ----
+_integrity:
+  hash: ""
+  algorithm: "sha256"
