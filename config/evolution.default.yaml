@@ -1,0 +1,330 @@
+# ============================================================
+# KHAOS 进化框架默认配置文件（全球顶级对冲基金生产级）
+# ============================================================
+# 版本: 2.5.0
+# 兼容引擎版本: >=2.5.0, <3.0.0
+#
+# 升级指南: 从 2.4.0 升级需注意 shadow_data_required 已改为天数，
+#           strategy_instance_id 必须设置，不再有默认值。
+#
+# 本文件定义策略自动进化、参数优化、RL 训练、元学习及生成式压力测试的参数。
+# 所有敏感信息必须通过环境变量注入，严禁明文填写。
+# 完整性校验: 部署前必须验证文件哈希及签名，并填入 _integrity 段。
+# ============================================================
+
+evolution:
+  # 全局启用/禁用（可被前端开关覆盖）
+  enabled: true
+
+  # 策略实例标识（必须由环境变量 KHAOS_INSTANCE_ID 显式设定，无默认值）
+  strategy_instance_id: "${KHAOS_INSTANCE_ID}"
+
+  # ---- 分布式锁（防止并发执行同一任务） ----
+  distributed_lock:
+    backend: "redis"
+    url: "${REDIS_LOCK_URL}"           # redis[s]://host:port/db
+    key_prefix: "khaos_evolution_lock"
+    default_timeout_sec: 3600          # 锁默认超时
+    retry_attempts: 3
+    retry_delay_sec: 10
+
+  # ---- 执行与资源控制 ----
+  execution:
+    max_parallel_tasks: 2
+    task_timeout_minutes: 120           # 全局默认，模块可覆盖
+    resource_limits:
+      cpu_cores: 8
+      memory_gb: 32
+      gpu_required: true
+      gpu_type_recommended: "nvidia-tesla-v100"
+      gpu_memory_gb: 16
+    retry:
+      max_attempts: 3
+      backoff: "exponential"
+      initial_delay_sec: 60
+    # 临时文件清理
+    cleanup:
+      auto_clean: true
+      temp_dir: "/tmp/khaos_evolution"
+      max_age_hours: 24
+      schedule: "0 2 * * *"             # 每天凌晨2点清理
+    celery:
+      broker_url: "${CELERY_BROKER_URL}"   # 强制使用 rediss:// 或 amqps://
+      broker_use_ssl: true
+      result_backend: "${CELERY_RESULT_BACKEND}"
+      task_track_started: true
+      timezone: "UTC"
+
+  # ---- 数据与存储 ----
+  data:
+    shadow_signals:
+      # 建议使用 DATABASE_URL 环境变量以安全处理特殊字符
+      database_url: "${SHADOW_DATABASE_URL}"
+      ssl_mode: "require"
+    historical_data_path: "s3://khaos-market-data/"
+    feature_store: "s3://khaos-features/"
+    aws_credentials:
+      access_key_id: "${AWS_ACCESS_KEY_ID}"
+      secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+      region: "${AWS_REGION:-us-east-1}"
+    # 存储权限与加密
+    storage_permissions:
+      s3_acl: "private"
+      encryption: "AES256"
+
+  # ---- 贝叶斯参数优化 (BAPO) ----
+  bayesian_optimization:
+    enabled: false
+    schedule:
+      cron: "0 3 1 * *"
+      timezone: "UTC"
+    task_timeout_minutes: 180          # 覆盖全局超时
+    objective: "calmar"
+    metric_window_days: 90
+    shadow_data_required_days: 180      # 需要至少180个日历日的数据
+    n_initial_points: 20
+    n_bayesian_iterations: 80
+    # 参数约束（嵌套结构，同时提供映射为配置管理器可识别的点号路径）
+    parameter_constraints:
+      modules:
+        trendline:
+          params:
+            q_ratio:
+              range: [0.001, 0.1]
+              distribution: "log_uniform"
+        stops:
+          params:
+            alpha_base:
+              range: [1.5, 4.0]
+              distribution: "uniform"
+        add_rules:
+          params:
+            step_atr:
+              range: [0.2, 1.2]
+              distribution: "uniform"
+        micro_accel:
+          params:
+            bpi_thresh:
+              range: [0.1, 0.4]
+              distribution: "uniform"
+            taker_thresh:
+              range: [0.1, 0.5]
+              distribution: "uniform"
+    # 映射到策略配置管理器的点号路径（用于自动更新）
+    parameter_mapping:
+      "modules.trendline.params.q_ratio": "modules.trendline.params.q_ratio"
+      "modules.stops.params.alpha_base": "modules.stops.params.alpha_base"
+      "modules.add_rules.params.step_atr": "modules.add_rules.params.step_atr"
+      "modules.micro_accel.params.bpi_thresh": "modules.micro_accel.params.bpi_thresh"
+      "modules.micro_accel.params.taker_thresh": "modules.micro_accel.params.taker_thresh"
+    constraint_max_drawdown_pct: 15.0
+    constraint_type: "hard"
+    parameter_smoothing_factor: 0.7
+    auto_apply: false
+    backup_previous_config: true
+    # 参数同步到运行中策略的方式
+    param_sync:
+      method: "api"                    # api / message_queue
+      url: "http://localhost:8000/api/config/update"
+      timeout_sec: 10
+      retry: 3
+
+  # ---- 强化学习训练 (KHAOS-RL) ----
+  reinforcement_learning:
+    enabled: false
+    algorithm: "ddqn"
+    task_timeout_minutes: 720          # RL 训练通常更长
+    pretrain:
+      data_years: 5
+      episode_max_steps: 10000
+      total_episodes: 50000
+      batch_size: 128
+      learning_rate: 0.0005
+      gamma: 0.999
+      epsilon_start: 1.0
+      epsilon_end: 0.05
+      epsilon_decay_steps: 50000
+      target_update_frequency: 1000
+      replay_buffer_size: 1000000
+      prioritized_replay: true
+      priority_alpha: 0.6
+      priority_beta_start: 0.4
+      priority_beta_end: 1.0
+    finetune:
+      schedule: "daily"
+      timezone: "UTC"
+      learning_rate: 1.0e-5
+      epochs_per_finetune: 5
+      min_new_samples: 1440
+    safety:
+      max_consecutive_losses: 5
+      daily_drawdown_rollback_pct: 4.0
+      reference: "strategy_equity"
+      shadow_evaluation_days: 30
+      min_win_rate_vs_previous: 0.55
+    model_compatibility:
+      # 保存/加载模型时记录引擎版本和配置哈希，确保兼容
+      enforce_version_check: true
+      engine_version: "${KHAOS_ENGINE_VERSION}"
+      config_hash: ""                  # 启动时计算并写入
+    model_registry:
+      storage: "s3://khaos-rl-models/"
+      keep_versions: 10
+    dependencies:
+      - "torch>=2.0,<3.0"
+      - "stable-baselines3>=2.0,<3.0"
+
+  # ---- 元学习 (KHAOS-Meta) ----
+  meta_learning:
+    enabled: false
+    model_type: "maml"
+    adaptation_mode: "shadow"           # 强制仅在影子环境执行
+    task_timeout_minutes: 240
+    task_pool:
+      - symbol: "BTCUSDT"
+        exchange: "binance"
+        timeframe: "3m"
+      - symbol: "ETHUSDT"
+        exchange: "binance"
+        timeframe: "3m"
+      - symbol: "XAUUSD"
+        exchange: "oanda"
+        timeframe: "3m"
+      - symbol: "CL"
+        exchange: "nymex"
+        timeframe: "3m"
+        contract_specs:
+          multiplier: 1000              # 每桶1000美元
+          tick_size: 0.01
+          tick_value: 10.0
+      - symbol: "ES"
+        exchange: "cme"
+        timeframe: "3m"
+        contract_specs:
+          multiplier: 50
+          tick_size: 0.25
+          tick_value: 12.5
+    inner_loop:
+      learning_rate: 0.01
+      steps: 3
+      support_set_size: 500
+    outer_loop:
+      learning_rate: 0.001
+      meta_batch_size: 4
+      total_iterations: 10000
+    adaptation:
+      query_set_size: 2000
+      min_adaptation_samples: 200
+    model_storage: "s3://khaos-meta-models/"
+    dependencies:
+      - "torch>=2.0,<3.0"
+      - "higher>=0.2"
+      - "torchmeta>=1.8"
+
+  # ---- 生成式压力测试 (OrderFlow-GAN) ----
+  gan_stress_testing:
+    enabled: false
+    schedule:
+      cron: "0 0 1 * *"
+      timezone: "UTC"
+    task_timeout_minutes: 300
+    training:
+      data_source: "kline_3m"
+      data_resample:
+        method: "none"
+      conditional_labels:
+        - "normal_market"               # 增加正常市场基准
+        - "trend"
+        - "ranging"
+        - "flash_crash"
+        - "liquidity_dry_up"
+        - "short_squeeze"
+        - "news_spike"
+      label_distribution:               # 各标签生成比例
+        normal_market: 0.3
+        trend: 0.15
+        ranging: 0.15
+        flash_crash: 0.1
+        liquidity_dry_up: 0.1
+        short_squeeze: 0.1
+        news_spike: 0.1
+      sequence_length: 20
+      epochs: 5000
+      batch_size: 64
+      learning_rate: 0.0002
+      lambda_supervised: 1.0
+      lambda_mode: 0.5
+    generation:
+      scenarios_per_label: 1000
+      extreme_vol_multiplier: 5.0
+      output_format: "parquet"
+      output_path: "s3://khaos-stress-data/"
+    evaluation:
+      metrics: ["sharpe", "max_drawdown", "var_95", "cvar_95"]
+      fail_thresholds:
+        max_drawdown_pct: 30.0
+        var_95_pct: 15.0
+        sharpe_min: 0.0
+      on_failure:
+        action: "alert_and_block"
+        escalation: ["email", "pagerduty"]
+    auto_retrain: false
+    dependencies:
+      - "torch>=2.0,<3.0"
+      - "tgan>=1.0"
+
+  # ---- 任务依赖关系 (可选 DAG) ----
+  task_dependencies:
+    - name: "rl_after_bayesian"
+      upstream: "bayesian_optimization"
+      downstream: "reinforcement_learning.pretrain"
+      condition: "upstream_success"
+      on_failure: "skip"               # skip / retry_upstream / alert_only
+
+  # ---- 监控与报警 ----
+  monitoring:
+    heartbeat_interval_sec: 60
+    metrics_export:
+      prometheus: true
+      # 端口分配策略: fixed (使用指定端口), incremental (基于实例ID自动偏移)
+      prometheus_port: "${PROMETHEUS_PORT:-9091}"
+      port_allocation: "incremental"     # 多实例自动偏移
+    alert_channels:
+      - type: "pagerduty"               # 1=最高优先级
+        priority: 1
+        fallback: "webhook"
+        api_key: "${PAGERDUTY_API_KEY}"
+      - type: "webhook"
+        priority: 2
+        url: "${ALERT_WEBHOOK_URL}"
+        fallback: "email"
+      - type: "email"
+        priority: 3
+        recipients: ["ml-ops@khaosfund.com"]
+    progress_logging: true
+
+  # ---- 合规与审计 ----
+  compliance:
+    audit_log_enabled: true
+    experiment_tracking: "mlflow"
+    tracking_uri: "${MLFLOW_TRACKING_URI}"
+    retention_days: 365
+    config_schema_version: "2.5.0"      # 记录当前配置版本
+
+  # ---- 灾难恢复 ----
+  disaster_recovery:
+    # 恢复文档链接
+    runbook_url: "https://wiki.khaosfund.com/evolution-dr"
+    backup:
+      database_backup_schedule: "0 4 * * *"
+      model_backup_schedule: "0 5 * * *"
+      retention_days: 90
+    restore_procedure: "refer_to_runbook"
+
+# ---- 完整性校验 ----
+_integrity:
+  hash: ""
+  signature: ""
+  algorithm: "sha256"
+  signature_algorithm: "ed25519"
+  public_key: ""
